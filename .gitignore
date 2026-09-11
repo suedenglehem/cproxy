@@ -1,0 +1,6 @@
+# runtime artifacts
+proxy.log
+*.log
+
+# per-machine config (created by install.cmd) — keep proxy.env.example in the repo
+proxy.env
