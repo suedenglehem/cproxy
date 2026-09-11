@@ -243,11 +243,30 @@ function openaiToAnthropic(resp, model) {
     content,
     stop_reason: mapFinishReason(choice.finish_reason),
     stop_sequence: null,
-    usage: {
-      input_tokens: resp.usage?.prompt_tokens ?? 0,
-      output_tokens: resp.usage?.completion_tokens ?? 0,
-    },
+    usage: anthropicUsage(resp.usage),
   };
+}
+
+/**
+ * Map OpenAI/llama.cpp usage to Anthropic usage. Recent llama-server builds
+ * report KV-cache reuse as prompt_cache_hit_tokens / prompt_cache_miss_tokens
+ * (their sum equals prompt_tokens). We surface those as Anthropic's
+ * cache_read_input_tokens / cache_creation_input_tokens so Claude Code can
+ * display real cache stats, and shrink input_tokens to the non-cached portion
+ * (Anthropic counts input_tokens excluding cached tokens).
+ */
+function anthropicUsage(u) {
+  const usage = u || {};
+  const promptTokens = usage.prompt_tokens ?? 0;
+  const cacheRead = usage.prompt_cache_hit_tokens ?? 0;
+  const cacheCreate = usage.prompt_cache_miss_tokens ?? 0;
+  const out = {
+    input_tokens: Math.max(0, promptTokens - cacheRead - cacheCreate),
+    output_tokens: usage.completion_tokens ?? 0,
+  };
+  if (cacheRead) out.cache_read_input_tokens = cacheRead;
+  if (cacheCreate) out.cache_creation_input_tokens = cacheCreate;
+  return out;
 }
 
 /* ------------------------------------------------------------------ *
@@ -266,7 +285,7 @@ class StreamTranslator {
     this.finishReason = null;
     this.finalUsageSeen = false; // true once the empty-choices usage chunk arrives
     this.closed = false;
-    this.usage = { input_tokens: 0, output_tokens: 0 };
+    this.rawUsage = null; // last raw OpenAI/llama.cpp usage object seen
   }
 
   sse(event, data) {
@@ -359,9 +378,9 @@ class StreamTranslator {
   }
 
   captureUsage(usage) {
-    if (usage) {
-      this.usage.input_tokens = usage.prompt_tokens ?? this.usage.input_tokens;
-      this.usage.output_tokens = usage.completion_tokens ?? this.usage.output_tokens;
+    // Keep the raw upstream usage object; it is mapped to Anthropic shape in end().
+    if (usage && (usage.prompt_tokens != null || usage.completion_tokens != null)) {
+      this.rawUsage = usage;
     }
   }
 
@@ -383,7 +402,7 @@ class StreamTranslator {
     out += this.sse('message_delta', {
       type: 'message_delta',
       delta: { stop_reason: stopReason, stop_sequence: null },
-      usage: { input_tokens: this.usage.input_tokens, output_tokens: this.usage.output_tokens },
+      usage: anthropicUsage(this.rawUsage),
     });
     out += this.sse('message_stop', { type: 'message_stop' });
     return out;
