@@ -11,17 +11,41 @@
  * It handles both streaming (SSE) and non-streaming responses, tool calls,
  * images, system prompts, and stop sequences.
  *
- * Configuration (environment variables):
+ * Configuration (environment variables, or KEY=VALUE lines in a proxy.env
+ * file next to this script — real environment variables always win):
  *   PORT            listen port                     (default 8787)
  *   HOST            bind address                    (default 127.0.0.1)
  *   UPSTREAM        OpenAI base url                 (default http://localhost:8080/v1)
  *   UPSTREAM_MODEL  force this model id upstream    (default: pass through)
  *   STRIP_TOOLS     "1" to drop tools from requests (default off)
  *   LOG             "1" for verbose request logging (default on)
+ *   HEALTH_POLL_MS  how often to probe the upstream (default 5000)
  */
 
 import http from 'node:http';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
+
+// Load proxy.env (KEY=VALUE lines, # comments) next to this script. Real env
+// vars win — so the Windows service can override anything if it wants to.
+try {
+  const envFile = path.join(path.dirname(fileURLToPath(import.meta.url)), 'proxy.env');
+  for (const line of fs.readFileSync(envFile, 'utf8').split(/\r?\n/)) {
+    const m = /^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)\s*$/.exec(line);
+    if (!m || line.trim().startsWith('#')) continue;
+    process.env[m[1]] ??= m[2];
+  }
+} catch { /* no proxy.env — fine */ }
+
+// CLI flags beat everything (this is how the Windows service passes its
+// editable startup parameters): node proxy.mjs --port 8788 --host 127.0.0.1 [--upstream URL]
+for (let i = 2; i < process.argv.length - 1; i++) {
+  if (process.argv[i] === '--port') process.env.PORT = process.argv[++i];
+  else if (process.argv[i] === '--host') process.env.HOST = process.argv[++i];
+  else if (process.argv[i] === '--upstream') process.env.UPSTREAM = process.argv[++i];
+}
 
 const PORT = Number(process.env.PORT || 8787);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -29,10 +53,61 @@ const UPSTREAM = (process.env.UPSTREAM || 'http://localhost:8080/v1').replace(/\
 const UPSTREAM_MODEL = process.env.UPSTREAM_MODEL || '';
 const STRIP_TOOLS = process.env.STRIP_TOOLS === '1';
 const LOG = process.env.LOG !== '0';
+const HEALTH_POLL_MS = Number(process.env.HEALTH_POLL_MS || 5000);
 
 function log(...args) {
   if (LOG) console.error('[proxy]', ...args);
 }
+
+/* ------------------------------------------------------------------ *
+ * Upstream health monitor
+ *
+ * Probes the upstream every HEALTH_POLL_MS. Any HTTP response counts as
+ * "alive" (even a 5xx — the server is up, maybe still loading a model);
+ * only network errors/timeouts count as dead. We log exactly ONE line when
+ * it goes down and one when it comes back, so a long outage doesn't spam
+ * the log. While it's dead, /v1/messages answers 503 with a message that
+ * tells Claude Code (and you) what is waiting on what.
+ * ------------------------------------------------------------------ */
+
+const upstreamUrl = new URL(UPSTREAM);
+const UPSTREAM_LABEL = `${upstreamUrl.hostname}:${upstreamUrl.port || (upstreamUrl.protocol === 'https:' ? 443 : 80)}`;
+
+let upstreamUp = null; // unknown until the first probe lands
+
+function probeUpstream() {
+  return new Promise((resolve) => {
+    const req = http.request(
+      {
+        hostname: upstreamUrl.hostname,
+        port: upstreamUrl.port || (upstreamUrl.protocol === 'https:' ? 443 : 80),
+        path: '/models', // cheap endpoint every OpenAI-compatible server has
+        method: 'GET',
+        timeout: 3000,
+      },
+      (res) => {
+        res.resume(); // drain so the socket can be reused/closed cleanly
+        resolve(true); // any HTTP response = the server is alive
+      }
+    );
+    req.on('timeout', () => req.destroy(new Error('probe timeout')));
+    req.on('error', () => resolve(false));
+    req.end();
+  });
+}
+
+async function healthLoop() {
+  for (;;) {
+    const up = await probeUpstream();
+    if (up !== upstreamUp) {
+      log(up ? `upstream ${UPSTREAM_LABEL} is back — resuming requests` : `upstream ${UPSTREAM_LABEL} is DOWN — incoming requests will get a "not available yet" 503 until it returns`);
+      upstreamUp = up;
+    }
+    await new Promise((r) => setTimeout(r, HEALTH_POLL_MS));
+  }
+}
+
+healthLoop(); // fire and forget; never rejects
 
 /* ------------------------------------------------------------------ *
  * Request translation: Anthropic -> OpenAI
@@ -451,7 +526,7 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && (req.url === '/health' || req.url === '/')) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, upstream: UPSTREAM }));
+      res.end(JSON.stringify({ ok: true, upstream: UPSTREAM, upstream_up: upstreamUp }));
       return;
     }
 
@@ -471,6 +546,21 @@ const server = http.createServer(async (req, res) => {
     }
 
     const raw = await readBody(req);
+
+    // Upstream is down: answer fast with a meaningful 503 (Claude Code retries
+    // on 5xx, so it will pick up automatically once the server returns).
+    if (!upstreamUp) {
+      log(`503 upstream ${UPSTREAM_LABEL} not available yet`);
+      res.writeHead(503, { 'Content-Type': 'application/json', 'Retry-After': String(Math.ceil(HEALTH_POLL_MS / 1000)) });
+      res.end(JSON.stringify({
+        error: {
+          type: 'upstream_unavailable',
+          message: `Upstream LLM server (${UPSTREAM_LABEL}) is not available yet. The proxy is running and will retry automatically — please try again in a few seconds.`,
+        },
+      }));
+      return;
+    }
+
     let body;
     try {
       body = JSON.parse(raw || '{}');

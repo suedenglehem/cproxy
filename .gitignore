@@ -1,6 +1,13 @@
 # runtime artifacts
 proxy.log
 *.log
+logs/
+
+# Windows service files generated at install time (daemon\cproxy.exe + xml)
+daemon/
+
+# bundled portable Node runtime, downloaded by install.cmd
+runtime/
 
 # per-machine config (created by install.cmd) — keep proxy.env.example in the repo
 proxy.env
