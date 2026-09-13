@@ -40,11 +40,12 @@ try {
 } catch { /* no proxy.env — fine */ }
 
 // CLI flags beat everything (this is how the Windows service passes its
-// editable startup parameters): node proxy.mjs --port 8788 --host 127.0.0.1 [--upstream URL]
+// editable startup parameters): node proxy.mjs --port 8788 --host 127.0.0.1 [--upstream URL] [--backend vllm]
 for (let i = 2; i < process.argv.length - 1; i++) {
   if (process.argv[i] === '--port') process.env.PORT = process.argv[++i];
   else if (process.argv[i] === '--host') process.env.HOST = process.argv[++i];
   else if (process.argv[i] === '--upstream') process.env.UPSTREAM = process.argv[++i];
+  else if (process.argv[i] === '--backend') process.env.BACKEND = process.argv[++i];
 }
 
 const PORT = Number(process.env.PORT || 8787);
@@ -54,6 +55,10 @@ const UPSTREAM_MODEL = process.env.UPSTREAM_MODEL || '';
 const STRIP_TOOLS = process.env.STRIP_TOOLS === '1';
 const LOG = process.env.LOG !== '0';
 const HEALTH_POLL_MS = Number(process.env.HEALTH_POLL_MS || 5000);
+// Which OpenAI-compatible server is upstream — only affects the health probe
+// path: llama-server serves /models, vllm only serves /v1/models. Anything
+// other than 'vllm' behaves as llama-server (the default).
+const BACKEND = (process.env.BACKEND || 'llama-server').toLowerCase();
 
 function log(...args) {
   if (LOG) console.error('[proxy]', ...args);
@@ -62,7 +67,8 @@ function log(...args) {
 /* ------------------------------------------------------------------ *
  * Upstream health monitor
  *
- * Probes the upstream every HEALTH_POLL_MS. Any HTTP response counts as
+ * Probes the upstream every HEALTH_POLL_MS (/models for llama-server,
+ * /v1/models for vllm). Any HTTP response counts as
  * "alive" (even a 5xx — the server is up, maybe still loading a model);
  * only network errors/timeouts count as dead. We log exactly ONE line when
  * it goes down and one when it comes back, so a long outage doesn't spam
@@ -81,7 +87,7 @@ function probeUpstream() {
       {
         hostname: upstreamUrl.hostname,
         port: upstreamUrl.port || (upstreamUrl.protocol === 'https:' ? 443 : 80),
-        path: '/models', // cheap endpoint every OpenAI-compatible server has
+        path: BACKEND === 'vllm' ? '/v1/models' : '/models', // cheap models endpoint; route differs per backend
         method: 'GET',
         timeout: 3000,
       },
@@ -526,7 +532,7 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.method === 'GET' && (req.url === '/health' || req.url === '/')) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, upstream: UPSTREAM, upstream_up: upstreamUp }));
+      res.end(JSON.stringify({ ok: true, backend: BACKEND, upstream: UPSTREAM, upstream_up: upstreamUp }));
       return;
     }
 
@@ -691,5 +697,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, HOST, () => {
-  log(`listening on http://${HOST}:${PORT} -> ${UPSTREAM}`);
+  log(`listening on http://${HOST}:${PORT} -> ${UPSTREAM} (backend: ${BACKEND})`);
 });

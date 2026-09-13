@@ -1,4 +1,5 @@
 # runtime artifacts
+.resume
 proxy.log
 *.log
 logs/

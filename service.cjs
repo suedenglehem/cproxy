@@ -12,7 +12,8 @@
  * changed without touching code:
  *
  *   node service.cjs install [PORT] [HOST]    register + start  (needs admin)
- *   node service.cjs set --port N [--host H]  change params, restarts (admin)
+ *   node service.cjs set --port N [--host H] [--upstream URL] [--backend llama-server|vllm]
+ *                                              change params, restarts (admin)
  *   node service.cjs uninstall                stop + remove     (needs admin)
  *   node service.cjs start | stop | restart
  *   node service.cjs status                   state + current params (no admin)
@@ -121,8 +122,12 @@ function readParams() {
   }
 }
 
-function writeParams(port, host, upstream) {
-  const params = `--port ${port} --host ${host}${upstream ? ` --upstream ${upstream}` : ''}`;
+function buildParams(port, host, upstream, backend) {
+  return `--port ${port} --host ${host}${upstream ? ` --upstream ${upstream}` : ''}${backend ? ` --backend ${backend}` : ''}`;
+}
+
+function writeParams(port, host, upstream, backend) {
+  const params = buildParams(port, host, upstream, backend);
   // 1. WinSW config (what the service actually reads on start).
   if (fs.existsSync(XML_FILE)) {
     let xml = fs.readFileSync(XML_FILE, 'utf8');
@@ -155,21 +160,23 @@ switch (cmd) {
   }
 
   case 'set': {
-    // node service.cjs set --port N [--host H] [--upstream URL|""]   ("" = drop flag, fall back to proxy.env)
+    // node service.cjs set --port N [--host H] [--upstream URL|""] [--backend llama-server|vllm|""]   ("" = drop flag, fall back to proxy.env)
     const args = process.argv.slice(3);
-    let port, host, upstream;
+    let port, host, upstream, backend;
     for (let i = 0; i < args.length; i++) {
       if (args[i] === '--port') port = args[++i];
       else if (args[i] === '--host') host = args[++i];
       else if (args[i] === '--upstream') upstream = args[++i];
+      else if (args[i] === '--backend') backend = args[++i];
     }
     const cur = readParams();
     if (!cur) done(false, 'service not installed — run install first');
     port = port ?? /--port\s+(\S+)/.exec(cur)?.[1] ?? '8787';
     host = host ?? /--host\s+(\S+)/.exec(cur)?.[1] ?? '127.0.0.1';
     upstream = upstream ?? /--upstream\s+(\S+)/.exec(cur)?.[1] ?? '';
-    const params = `--port ${port} --host ${host}${upstream ? ` --upstream ${upstream}` : ''}`;
-    writeParams(port, host, upstream);
+    backend = backend ?? /--backend\s+(\S+)/.exec(cur)?.[1] ?? '';
+    const params = buildParams(port, host, upstream, backend);
+    writeParams(port, host, upstream, backend);
     console.log(`[cproxy] startup parameters set to "${params}" — restarting service...`);
     robustRestart((err) => done(!err, err ? `restarted but: ${err}` : 'service restarted with new parameters'));
     break;
@@ -214,6 +221,6 @@ switch (cmd) {
   }
 
   default:
-    console.error('usage: node service.cjs install [PORT] [HOST] | set --port N [--host H] | uninstall | start | stop | restart | status');
+    console.error('usage: node service.cjs install [PORT] [HOST] | set --port N [--host H] [--upstream URL] [--backend llama-server|vllm] | uninstall | start | stop | restart | status');
     process.exit(1);
 }

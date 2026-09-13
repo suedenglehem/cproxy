@@ -57,13 +57,13 @@ install.cmd http://tr4:8080/v1 qwen3.8-27b 8787
 In any terminal — VS Code integrated terminal, PowerShell, cmd, Cygwin:
 
 ```bat
-claude
+claude.cmd
 ```
 
 Quick smoke test:
 
 ```bat
-claude -p "Reply with exactly: OK"
+claude.cmd -p "Reply with exactly: OK"
 ```
 
 You should see `OK`. A harmless diagnostic line `[claude-code:unrecognized_model] {"model":"qwen3.8-27b",...}` may appear — that's just Claude Code noting the model ID isn't a known Anthropic one; ignore it.
@@ -87,12 +87,13 @@ node service.cjs start | stop           control the service (admin)
 node service.cjs restart                robust stop→wait→start (admin)
 node service.cjs set --port 8787        change startup params, then auto-restarts (admin)
 node service.cjs set --upstream http://tr4:8080/v1
+node service.cjs set --backend vllm     llama-server or vllm (health-check route)
 node service.cjs uninstall              stop + remove the service (admin)
 ```
 
-### Changing port / host / upstream without touching code
+### Changing port / host / upstream / backend without touching code
 
-The proxy's `--port`, `--host` and optional `--upstream` are **startup parameters** baked into two places at install time:
+The proxy's `--port`, `--host` and optional `--upstream` / `--backend` are **startup parameters** baked into two places at install time:
 
 - `daemon\cproxy.xml` — what WinSW actually reads when it starts the service (authoritative)
 - registry `HKLM\SYSTEM\CurrentControlSet\Services\cproxy.exe\Parameters` (REG_SZ) — visible in regedit / service tools
@@ -102,6 +103,7 @@ Change them any of these ways, then restart:
 ```bat
 node service.cjs set --port 8790 --host 127.0.0.1        :: new port
 node service.cjs set --upstream ""                        :: drop the flag → proxy.env decides
+node service.cjs set --backend vllm                       :: upstream is vllm, not llama-server
 ```
 
 or edit `daemon\cproxy.xml` / the registry value by hand, then `node service.cjs restart`. If you change the **port**, also update `ANTHROPIC_BASE_URL` in `%USERPROFILE%\.claude\settings.json` to match.
@@ -131,6 +133,10 @@ Plain `KEY=VALUE` lines; `#` starts a comment. Loaded by `proxy.mjs` at startup 
 # Where your OpenAI-compatible server lives (no trailing slash needed)
 UPSTREAM=http://tr4:8080/v1
 
+# Which server is upstream — only affects the health-check route:
+# llama-server probes /models, vllm probes /v1/models
+BACKEND=llama-server
+
 # Optional overrides — defaults shown
 PORT=8787
 HOST=127.0.0.1
@@ -150,6 +156,7 @@ After editing, restart the service (`node service.cjs restart`) — or just `sta
 | `PORT` | `8787` | Local port the proxy listens on |
 | `HOST` | `127.0.0.1` | Bind address (keep local unless you need LAN access) |
 | `UPSTREAM` | `http://localhost:8080/v1` | OpenAI-compatible base URL of your LLM server |
+| `BACKEND` | `llama-server` | Upstream type: `llama-server` or `vllm` — picks the health-probe route (`/models` vs `/v1/models`) |
 | `HEALTH_POLL_MS` | `5000` | Milliseconds between upstream liveness probes |
 | `UPSTREAM_MODEL` | *(pass-through)* | Force this model id on every upstream request |
 | `STRIP_TOOLS` | off | Set `1` to remove tools from requests (server without function calling) |
@@ -168,7 +175,8 @@ The installer writes this; tweak values as needed:
     "ANTHROPIC_MODEL": "qwen3.8-27b",
     "MAX_THINKING_TOKENS": "0",
     "DISABLE_PROMPT_CACHING": "1",
-    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "4096"
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "65536",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "140000"
   }
 }
 ```
@@ -182,7 +190,7 @@ Notes:
 
 ## Upstream health monitor & graceful 503s
 
-On startup (and continuously) the proxy probes `{UPSTREAM}/models` every `HEALTH_POLL_MS` (default 5 s, 3 s timeout). **Any** HTTP response counts as "alive"; only a network error or timeout means "down". This matters because your GPU box may take a while to boot its model after you power it on.
+On startup (and continuously) the proxy probes the upstream's models endpoint every `HEALTH_POLL_MS` (default 5 s, 3 s timeout): `/models` for llama-server, `/v1/models` for vllm — set with `BACKEND` in `proxy.env` or `node service.cjs set --backend vllm`. **Any** HTTP response counts as "alive"; only a network error or timeout means "down". This matters because your GPU box may take a while to boot its model after you power it on.
 
 Behavior:
 
@@ -201,7 +209,7 @@ Check live status any time:
 
 ```bat
 curl http://127.0.0.1:8787/health
-:: { "ok": true, "upstream": "http://tr4:8080/v1", "upstream_up": true }
+:: { "ok": true, "backend": "llama-server", "upstream": "http://tr4:8080/v1", "upstream_up": true }
 ```
 
 `upstream_up` is `true`/`false` (or `null` before the first probe completes).
@@ -228,7 +236,7 @@ exec "/cygdrive/c/Users/<your-user>/AppData/Roaming/npm/node_modules/@anthropic-
 - **Response direction (streaming)** — OpenAI SSE chunks are re-emitted as Anthropic events: `message_start`, `content_block_start/delta/stop`, `message_delta`, `message_stop`. Tool-call argument fragments stream through as `input_json_delta`.
 - **The llama.cpp usage quirk** — llama-server sends the `finish_reason` chunk, *then* a separate empty-choices chunk carrying `usage`, then `[DONE]`. The proxy waits for that final usage chunk before emitting `message_delta`/`message_stop`, so Claude Code's token accounting (and context compaction) stays correct.
 - **Prompt caching** — Anthropic-style `cache_control` markers are accepted and stripped during translation (OpenAI has no equivalent field, and llama.cpp reuses prompt prefixes implicitly via its KV cache). When your server reports KV-cache stats (`prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`, available in recent llama-server builds), the proxy maps them to Anthropic's `usage.cache_read_input_tokens` / `cache_creation_input_tokens` — so Claude Code shows real cache-hit numbers, and `input_tokens` is reported as the non-cached portion only (matching Anthropic semantics). Servers without those fields behave exactly as before.
-- **Health check** — `GET http://127.0.0.1:8787/health` returns `{ "ok": true, "upstream": "...", "upstream_up": true }`.
+- **Health check** — `GET http://127.0.0.1:8787/health` returns `{ "ok": true, "backend": "llama-server|vllm", "upstream": "...", "upstream_up": true }`.
 
 ## Troubleshooting
 
