@@ -1,5 +1,7 @@
 # cproxy — run Claude Code against llama.cpp (Windows)
 
+I don't use lmstudo/ollama etc at home, it's either llama-server or vll running on dedicated box. claude on another. on windoze claude in vscode wanter such a proxy (somehow on linux it works without ! :-P). + on linux i use my crouter... 
+
 **cproxy** is a zero-dependency translation proxy that lets [Claude Code](https://docs.anthropic.com/en/docs/claude-code) talk to an OpenAI-compatible server such as llama.cpp's `llama-server`. No npm packages, no build step — just Node.js. It runs as a **real Windows service**: it starts at boot (no logon needed), survives logoff, and auto-restarts if it crashes.
 
 ```
